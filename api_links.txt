@@ -1,0 +1,9 @@
+f-soundtransit~rt
+Format	GTFS-RT
+URLs	
+GTFS Realtime Vehicle Positions: 
+http://api.pugetsound.onebusaway.org/api/gtfs_realtime/vehicle-positions-for-agency/40.pb
+GTFS Realtime Trip Updates: 
+http://api.pugetsound.onebusaway.org/api/gtfs_realtime/trip-updates-for-agency/40.pb
+GTFS Realtime Alerts: 
+http://api.pugetsound.onebusaway.org/api/gtfs_realtime/alerts-for-agency/40.pb
