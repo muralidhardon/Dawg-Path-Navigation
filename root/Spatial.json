@@ -1,0 +1,22 @@
+[
+    {"name": "UW Quad", "latitude": 47.6556, "longitude": -122.3078, "danger_level": 2},
+    {"name": "Red Square", "latitude": 47.6561, "longitude": -122.3095, "danger_level": 3},
+    {"name": "Husky Stadium", "latitude": 47.6505, "longitude": -122.3014, "danger_level": 1},
+    {"name": "U District Station", "latitude": 47.6612, "longitude": -122.3127, "danger_level": 5},
+    {"name": "University Way NE (The Ave)", "latitude": 47.6605, "longitude": -122.3130, "danger_level": 6},
+    {"name": "Burke Museum", "latitude": 47.6615, "longitude": -122.3094, "danger_level": 2},
+    {"name": "Drumheller Fountain", "latitude": 47.6539, "longitude": -122.3070, "danger_level": 3},
+    {"name": "Rainier Vista", "latitude": 47.6535, "longitude": -122.3063, "danger_level": 4},
+    {"name": "UW Tower", "latitude": 47.6618, "longitude": -122.3139, "danger_level": 4},
+    {"name": "Portage Bay Park", "latitude": 47.6487, "longitude": -122.3120, "danger_level": 2},
+    {"name": "Brooklyn Ave NE", "latitude": 47.6599, "longitude": -122.3146, "danger_level": 5},
+    {"name": "NE 45th St", "latitude": 47.6610, "longitude": -122.3129, "danger_level": 6},
+    {"name": "NE 50th St", "latitude": 47.6645, "longitude": -122.3125, "danger_level": 4},
+    {"name": "Ravenna Park Entrance", "latitude": 47.6681, "longitude": -122.3075, "danger_level": 3},
+    {"name": "Laurel Village", "latitude": 47.6642, "longitude": -122.3003, "danger_level": 2},
+    {"name": "Gas Works Park", "latitude": 47.6456, "longitude": -122.3344, "danger_level": 3},
+    {"name": "Montlake Bridge", "latitude": 47.6434, "longitude": -122.3041, "danger_level": 5},
+    {"name": "University Village", "latitude": 47.6636, "longitude": -122.2983, "danger_level": 2},
+    {"name": "UW Medical Center", "latitude": 47.6502, "longitude": -122.3051, "danger_level": 4},
+    {"name": "Cowen Park", "latitude": 47.6689, "longitude": -122.3149, "danger_level": 3}
+]

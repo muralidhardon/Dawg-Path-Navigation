@@ -4,7 +4,7 @@ import math
 import threading
 import requests
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, List
@@ -386,6 +386,15 @@ def get_eta(
     except Exception:
         # If StaticFiles can't be mounted for any reason, ignore so backend still works
         pass
+
+
+    # Provide a small JS config endpoint to expose the Google Maps API key to the client
+    @app.get("/maps_config.js")
+    def maps_config_js():
+        key = os.getenv("GOOGLE_MAPS_API_KEY", "")
+        # Return a JS snippet that sets a global var (the client will then load the Maps script dynamically)
+        body = f"window.GOOGLE_MAPS_API_KEY = '{key}';"
+        return Response(content=body, media_type="application/javascript")
 
 
 @app.get('/routes')
