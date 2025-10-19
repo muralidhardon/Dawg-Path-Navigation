@@ -23,8 +23,12 @@ dist-ssr
 *.sln
 *.sw?
 
+# Python
 venv/
-.env
-*.pyc
-__pycache__/
 backend/venv/
+__pycache__/
+*.pyc
+.env
+
+# Node (if any)
+node_modules/
