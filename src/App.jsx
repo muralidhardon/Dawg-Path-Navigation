@@ -519,19 +519,19 @@ function App() {
               className='hover:text-gray-400 cursor-pointer' 
               onClick={() => setIsAddingEvent(true)}
             >
-              I want to add an event
+              I want to add an event.
             </p>
             <p 
               className='hover:text-gray-400 cursor-pointer' 
               onClick={() => setIsReportingCrowd(true)}
             >
-              I want to report a crowded area
+              I want to report a crowded area.
             </p> 
             <p 
               className='hover:text-gray-400 cursor-pointer'
               onClick={() => setIsReportingDanger(true)}
             >
-              I want to report a dangerous area
+              I want to report a dangerous area.
             </p>
           </div>
         </div>
