@@ -29,6 +29,7 @@ from sqlalchemy import (
 # --- config ---
 DB_URL = os.getenv("TRANSIT_DB", "sqlite:///transit.db")
 LIVE_FEED_URL = os.getenv("LOCAL_TRANSIT_API_URL")  # e.g. "https://your-transit-api.local/vehicles"
+LIVE_GTFS_RT_URL = os.getenv("LIVE_GTFS_RT_URL", "http://api.pugetsound.onebusaway.org/api/gtfs_realtime/vehicle-positions-for-agency/40.pb")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
 REPORT_DECAY_SECONDS = int(os.getenv("REPORT_DECAY_SECONDS", "600"))  # weight decay window
 
@@ -123,28 +124,93 @@ def weighted_avg_reports(reports):
 
 # --- Live feed polling ---
 def poll_live_feed_loop():
-    if not LIVE_FEED_URL:
-        return  # nothing to poll
+    # If neither JSON feed nor GTFS-RT URL is configured, nothing to poll
+    if not LIVE_FEED_URL and not LIVE_GTFS_RT_URL:
+        return
+
+    # Try to import GTFS realtime protobuf bindings if available
+    gtfsrt_parser = None
+    try:
+        from google.transit import gtfs_realtime_pb2
+        gtfsrt_parser = gtfs_realtime_pb2
+    except Exception:
+        gtfsrt_parser = None
+
     while True:
-        try:
-            resp = requests.get(LIVE_FEED_URL, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                with SessionLocal() as db:
-                    upd = LiveUpdate(payload=data, fetched_at=datetime.utcnow())
-                    db.add(upd)
-                    db.commit()
-        except Exception:
-            # silence errors to avoid killing thread; production should log
-            pass
+        now = datetime.utcnow()
+        # First, try JSON-style feed if provided
+        if LIVE_FEED_URL:
+            try:
+                resp = requests.get(LIVE_FEED_URL, timeout=5)
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = {"raw": resp.text}
+                    with SessionLocal() as db:
+                        upd = LiveUpdate(payload={"source": "json_feed", "fetched_at": now.isoformat(), "data": data}, fetched_at=now)
+                        db.add(upd)
+                        db.commit()
+            except Exception:
+                # silence - in production you'd log
+                pass
+
+        # Next, try GTFS-Realtime protobuf feed
+        if LIVE_GTFS_RT_URL:
+            try:
+                resp = requests.get(LIVE_GTFS_RT_URL, timeout=5)
+                if resp.status_code == 200 and resp.content:
+                    parsed = None
+                    # If gtfs bindings available, parse protobuf to dict
+                    if gtfsrt_parser:
+                        try:
+                            feed = gtfsrt_parser.FeedMessage()
+                            feed.ParseFromString(resp.content)
+                            # convert to JSON-friendly structure
+                            parsed = {"header": {"gtfs_realtime_version": getattr(feed.header, "gtfs_realtime_version", None), "timestamp": getattr(feed.header, "timestamp", None)}, "entities": []}
+                            for ent in feed.entity:
+                                e = {"id": ent.id}
+                                if ent.HasField("vehicle"):
+                                    v = ent.vehicle
+                                    vj = {}
+                                    # copy a few common fields
+                                    if v.trip and v.trip.trip_id:
+                                        vj["trip_id"] = v.trip.trip_id
+                                    if v.trip and v.trip.route_id:
+                                        vj["route_id"] = v.trip.route_id
+                                    if v.vehicle and v.vehicle.id:
+                                        vj["vehicle_id"] = v.vehicle.id
+                                    if v.position:
+                                        vj["position"] = {"lat": v.position.latitude, "lon": v.position.longitude, "speed": getattr(v.position, "speed", None)}
+                                    if v.current_stop_sequence:
+                                        vj["current_stop_sequence"] = v.current_stop_sequence
+                                    if v.stop_id:
+                                        vj["stop_id"] = v.stop_id
+                                    if v.timestamp:
+                                        vj["timestamp"] = v.timestamp
+                                    e["vehicle"] = vj
+                                parsed["entities"].append(e)
+                        except Exception:
+                            parsed = {"raw_bytes_length": len(resp.content)}
+                    else:
+                        # No protobuf parser available; store raw bytes length and note it's protobuf
+                        parsed = {"raw_bytes_length": len(resp.content), "note": "protobuf_not_parsed"}
+
+                    with SessionLocal() as db:
+                        upd = LiveUpdate(payload={"source": "gtfs_rt", "fetched_at": now.isoformat(), "data": parsed}, fetched_at=now)
+                        db.add(upd)
+                        db.commit()
+            except Exception:
+                pass
+
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
 # --- App ---
 app = FastAPI(title="Transit Backend (crowd + live feed)")
 
-# start background poller thread at import/run time
-if LIVE_FEED_URL:
+# start background poller thread at import/run time if any feed URL is present
+if LIVE_FEED_URL or LIVE_GTFS_RT_URL:
     t = threading.Thread(target=poll_live_feed_loop, daemon=True)
     t.start()
 
