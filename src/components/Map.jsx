@@ -303,7 +303,7 @@ function Map({
           <HeatmapLayer
             data={heatmapData}
             options={{
-              radius: 35,
+              radius: 45,
               opacity: 0.6,
               gradient: [
                 "rgba(255, 215, 0, 0)",
