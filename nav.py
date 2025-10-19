@@ -370,6 +370,41 @@ def health():
         "realtime": bool(TRIP_UPDATES_URL),
     }
 
+# Nearby stops endpoint
+@app.get("/nearby_stops")
+def nearby_stops(
+    lat: float = Query(..., description="latitude"),
+    lng: float = Query(..., description="longitude"),
+    limit: int = Query(10, ge=1, le=50),
+    max_walk_m: int = Query(MAX_WALK_METERS_DEFAULT, ge=50, description="search radius in meters")
+):
+    """Return nearest GTFS stops to a point with distance and served routes."""
+    results = []
+    for sid, dist in nearest_stops(lat, lng, limit=limit, max_m=max_walk_m):
+        s = STOPS[sid]
+        routes = sorted(list(ROUTES_BY_STOP.get(sid, set())))
+        results.append({
+            "stop_id": sid,
+            "name": s["name"],
+            "lat": s["lat"],
+            "lng": s["lon"],
+            "distance_m": round(dist, 1),
+            "routes": routes
+        })
+    return results
+
+# Stop routes endpoint
+@app.get("/stop_routes")
+def stop_routes(stop_id: str = Query(..., description="GTFS stop_id")):
+    """List route ids (and display names) that serve a stop."""
+    if stop_id not in STOPS:
+        raise HTTPException(status_code=404, detail="stop not found")
+    out = []
+    for rid in sorted(list(ROUTES_BY_STOP.get(stop_id, set()))):
+        r = ROUTES.get(rid, {"short": "", "long": ""})
+        out.append({"route_id": rid, "short_name": r.get("short") or "", "long_name": r.get("long") or ""})
+    return out
+
 @app.get("/plan", response_model=List[Itinerary])
 def plan(
     from_lat: float = Query(...),

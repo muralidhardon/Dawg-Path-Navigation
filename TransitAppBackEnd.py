@@ -1,84 +1,109 @@
 import os
 import time
 import math
-import csv
 import threading
 import requests
 from datetime import datetime, timedelta
-from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import create_engine, Column, Float, String, Integer, DateTime, JSON
+import csv
+from pathlib import Path
 from dotenv import load_dotenv
 from google.transit import gtfs_realtime_pb2
 
-# --- load environment ---
 load_dotenv()
+
+
+
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    Float,
+    String,
+    DateTime,
+    JSON,
+    func,
+    select,
+)
 
 # --- config ---
 DB_URL = os.getenv("TRANSIT_DB", "sqlite:///transit.db")
-GTFS_DIR = os.getenv("GTFS_DIR", "./gtfs_static")
-TRIP_UPDATES_URL = os.getenv("TRIP_UPDATES_URL")
-VEHICLE_POSITIONS_URL = os.getenv("VEHICLE_POSITIONS_URL")
-ALERTS_URL = os.getenv("ALERTS_URL")
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "12"))
-REPORT_DECAY_SECONDS = int(os.getenv("REPORT_DECAY_SECONDS", "600"))
+LIVE_FEED_URL = os.getenv("LOCAL_TRANSIT_API_URL")  # e.g. "https://your-transit-api.local/vehicles"
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
+REPORT_DECAY_SECONDS = int(os.getenv("REPORT_DECAY_SECONDS", "600"))  # weight decay window
 
 # --- DB setup ---
 engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
 
+
 class Stop(Base):
     __tablename__ = "stops"
-    id = Column(String, primary_key=True)
+    id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     lat = Column(Float, nullable=False)
     lng = Column(Float, nullable=False)
+    # optional known schedules or route info could go here
     meta = Column(JSON, default={})
+
 
 class Report(Base):
     __tablename__ = "reports"
     id = Column(Integer, primary_key=True)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-    stop_id = Column(String, index=True)
-    line_id = Column(String, index=True)
-    arrival_seconds = Column(Integer)
-    mode = Column(String, default="transit")
+    stop_id = Column(Integer, index=True)
+    line_id = Column(String, index=True)  # e.g. "22" or "LINK_RED"
+    arrival_seconds = Column(Integer)  # seconds until arrival from report time
+    mode = Column(String, default="transit")  # walking, biking, transit
     lat = Column(Float, nullable=True)
     lng = Column(Float, nullable=True)
     extra = Column(JSON, default={})
+
+
+class LiveUpdate(Base):
+    __tablename__ = "live_updates"
+    id = Column(Integer, primary_key=True)
+    fetched_at = Column(DateTime, default=datetime.utcnow, index=True)
+    payload = Column(JSON)  # raw feed payload for lookup
+
 
 Base.metadata.create_all(bind=engine)
 
 # --- Pydantic models ---
 class ReportIn(BaseModel):
-    stop_id: str
+    stop_id: int
     line_id: str
     arrival_seconds: int
     mode: Optional[str] = "transit"
     lat: Optional[float] = None
     lng: Optional[float] = None
-    extra: Optional[dict] = {}
+    extra: Optional[dict] = Field(default_factory=dict)
+
 
 class StopOut(BaseModel):
-    id: str
+    id: int
     name: str
     lat: float
     lng: float
 
+
 class ETAOut(BaseModel):
-    stop_id: str
+    stop_id: int
     line_id: Optional[str]
     eta_seconds: int
-    source: str
+    source: str  # "crowd", "live_feed", "schedule", "estimate"
     details: dict
 
-# --- util functions ---
+
+# --- Utilities ---
 def haversine_km(lat1, lon1, lat2, lon2):
+    # returns distance in kilometers
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -86,213 +111,263 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
+
 def weighted_avg_reports(reports):
+    # reports: list of (arrival_seconds, age_seconds)
+    # weight = exp(-age / REPORT_DECAY_SECONDS)
     if not reports:
         return None
-    total_w, total = 0.0, 0.0
+    total_w = 0.0
+    total = 0.0
     for arrival, age in reports:
         w = math.exp(-age / max(1, REPORT_DECAY_SECONDS))
         total_w += w
         total += arrival * w
     return int(total / total_w) if total_w > 0 else None
 
-# --- static GTFS ---
-STOPS_STATIC, ROUTES_STATIC, TRIPS_STATIC, STOP_TIMES_BY_STOP = {}, {}, {}, {}
 
-def _t2s(t):
-    h, m, s = map(int, t.split(":"))
-    return h * 3600 + m * 60 + s
-
-def _now_sec_local():
-    d = datetime.now()
-    return d.hour * 3600 + d.minute * 60 + d.second
-
-def load_static_gtfs():
-    p = Path(GTFS_DIR)
-    with open(p/"stops.txt", newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            STOPS_STATIC[r["stop_id"]] = {"name": r["stop_name"], "lat": float(r["stop_lat"]), "lng": float(r["stop_lon"])}
-    with open(p/"routes.txt", newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            ROUTES_STATIC[r["route_id"]] = {"short": r.get("route_short_name") or "", "long": r.get("route_long_name") or ""}
-    with open(p/"trips.txt", newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            TRIPS_STATIC[r["trip_id"]] = {"route_id": r["route_id"]}
-    with open(p/"stop_times.txt", newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            STOP_TIMES_BY_STOP.setdefault(r["stop_id"], []).append(
-                {"trip_id": r["trip_id"], "arr_sec": _t2s(r["arrival_time"]), "seq": int(r["stop_sequence"])}
-            )
-    for lst in STOP_TIMES_BY_STOP.values():
-        lst.sort(key=lambda x: x["arr_sec"])
-try:
-    load_static_gtfs()
-except Exception as e:
-    print("GTFS load failed:", e)
-
-# seed DB stops
-with SessionLocal() as db:
-    if not db.query(Stop).first():
-        for sid, s in list(STOPS_STATIC.items())[:300]:
-            db.add(Stop(id=sid, name=s["name"], lat=s["lat"], lng=s["lng"]))
-        db.commit()
-
-# --- realtime caches ---
-TRIP_DELAY, TRIP_STOP_DELAY, VEHICLES, ALERTS = {}, {}, [], []
-
-def _fetch_pb(url):
-    r = requests.get(url, timeout=6)
-    r.raise_for_status()
-    feed = gtfs_realtime_pb2.FeedMessage()
-    feed.ParseFromString(r.content)
-    return feed
-
-def poll_trip_updates():
-    if not TRIP_UPDATES_URL: return
-    feed = _fetch_pb(TRIP_UPDATES_URL)
-    td, tsd = {}, {}
-    for ent in feed.entity:
-        tu = ent.trip_update
-        if not tu or not tu.trip.trip_id: continue
-        tid = tu.trip.trip_id
-        for su in tu.stop_time_update:
-            sid, d = su.stop_id, None
-            if su.arrival and su.arrival.HasField("delay"): d = su.arrival.delay
-            elif su.departure and su.departure.HasField("delay"): d = su.departure.delay
-            if sid and d is not None: tsd[(tid, sid)] = d
-        d0 = 0
-        for su in tu.stop_time_update:
-            if su.arrival and su.arrival.HasField("delay"): d0 = su.arrival.delay; break
-            if su.departure and su.departure.HasField("delay"): d0 = su.departure.delay; break
-        td[tid] = d0
-    TRIP_DELAY.clear(); TRIP_DELAY.update(td)
-    TRIP_STOP_DELAY.clear(); TRIP_STOP_DELAY.update(tsd)
-
-def poll_vehicle_positions():
-    if not VEHICLE_POSITIONS_URL: return
-    feed = _fetch_pb(VEHICLE_POSITIONS_URL)
-    rows = []
-    for ent in feed.entity:
-        v = ent.vehicle
-        if not v or not v.position: continue
-        rows.append({
-            "vehicle_id": (v.vehicle.id if v.vehicle and v.vehicle.id else ent.id),
-            "trip_id": v.trip.trip_id if v.trip and v.trip.trip_id else None,
-            "lat": v.position.latitude,
-            "lng": v.position.longitude,
-            "bearing": v.position.bearing if v.position.HasField("bearing") else None,
-            "stop_id": v.stop_id if v.HasField("stop_id") else None
-        })
-    VEHICLES.clear(); VEHICLES.extend(rows)
-
-def poll_alerts():
-    if not ALERTS_URL: return
-    feed = _fetch_pb(ALERTS_URL)
-    rows = []
-    for ent in feed.entity:
-        a = ent.alert
-        if not a: continue
-        header = a.header_text.translation[0].text if a.header_text.translation else ""
-        desc = a.description_text.translation[0].text if a.description_text.translation else ""
-        rows.append({"id": ent.id, "header": header, "desc": desc})
-    ALERTS.clear(); ALERTS.extend(rows)
-
-def poll_realtime_loop():
+# --- Live feed polling ---
+def poll_live_feed_loop():
+    if not LIVE_FEED_URL:
+        return  # nothing to poll
     while True:
         try:
-            poll_trip_updates()
-            poll_vehicle_positions()
-            poll_alerts()
+            resp = requests.get(LIVE_FEED_URL, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                with SessionLocal() as db:
+                    upd = LiveUpdate(payload=data, fetched_at=datetime.utcnow())
+                    db.add(upd)
+                    db.commit()
         except Exception:
+            # silence errors to avoid killing thread; production should log
             pass
         time.sleep(POLL_INTERVAL_SECONDS)
 
-t = threading.Thread(target=poll_realtime_loop, daemon=True)
-t.start()
 
-# --- helpers for /eta ---
-def next_arrivals_for_stop(stop_id, line_id=None, limit=8):
-    now = _now_sec_local()
-    rows = []
-    for st in STOP_TIMES_BY_STOP.get(stop_id, []):
-        trip = TRIPS_STATIC.get(st["trip_id"])
-        if not trip: continue
-        r_id = trip["route_id"]
-        delay = TRIP_STOP_DELAY.get((st["trip_id"], stop_id), TRIP_DELAY.get(st["trip_id"], 0))
-        eta = st["arr_sec"] + delay - now
-        if eta > -120:
-            rows.append({"trip_id": st["trip_id"], "route_id": r_id, "delay": delay, "eta": eta})
-    rows.sort(key=lambda x: x["eta"])
-    return rows[:limit]
+# --- App ---
+app = FastAPI(title="Transit Backend (crowd + live feed)")
 
-# --- FastAPI app ---
-app = FastAPI(title="UW Transit Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {
+        "db_url": DB_URL,
+        "live_feed_url_set": bool(LIVE_FEED_URL),
+        "poll_interval": POLL_INTERVAL_SECONDS,
+        "report_decay_seconds": REPORT_DECAY_SECONDS,
+    }
+
+# start background poller thread at import/run time
+if LIVE_FEED_URL:
+    t = threading.Thread(target=poll_live_feed_loop, daemon=True)
+    t.start()
+
 
 @app.post("/report", status_code=201)
 def create_report(r: ReportIn):
     with SessionLocal() as db:
-        rep = Report(**r.dict(), timestamp=datetime.utcnow())
+        rep = Report(
+            stop_id=r.stop_id,
+            line_id=r.line_id,
+            arrival_seconds=r.arrival_seconds,
+            mode=r.mode,
+            lat=r.lat,
+            lng=r.lng,
+            extra=r.extra,
+            timestamp=datetime.utcnow(),
+        )
         db.add(rep)
         db.commit()
         db.refresh(rep)
         return {"id": rep.id}
 
+
 @app.get("/stops", response_model=List[StopOut])
 def list_stops():
+    # return all stops; in a real app you'd page this
     with SessionLocal() as db:
         rows = db.query(Stop).all()
         return [StopOut(id=s.id, name=s.name, lat=s.lat, lng=s.lng) for s in rows]
 
+
+@app.post("/stops", status_code=201)
+def create_stop(s: StopOut):
+    with SessionLocal() as db:
+        st = Stop(id=s.id, name=s.name, lat=s.lat, lng=s.lng)
+        db.add(st)
+        db.commit()
+        return {"id": st.id}
+
+
 @app.get("/eta", response_model=ETAOut)
-def get_eta(stop_id: str, line_id: Optional[str] = None, origin_lat: Optional[float] = None, origin_lng: Optional[float] = None):
+def get_eta(
+    stop_id: int = Query(...),
+    line_id: Optional[str] = Query(None),
+    mode: str = Query("transit"),  # walking, biking, transit
+    origin_lat: Optional[float] = Query(None),
+    origin_lng: Optional[float] = Query(None),
+):
+    """
+    Compute ETA to a stop (and optionally for a specific line).
+    Algorithm:
+    - If users have recent reports for stop+line, compute weighted average (by recency).
+    - If live feed has data for that stop/line, incorporate it.
+    - If origin provided and mode is walking/biking, add walking/biking time to reach stop.
+    - Fallback to schedule-based estimate (simple periodic schedule) if no real data.
+    """
     now = datetime.utcnow()
     with SessionLocal() as db:
         stop = db.query(Stop).filter(Stop.id == stop_id).first()
         if not stop:
             raise HTTPException(status_code=404, detail="stop not found")
 
+        # collect recent reports (stop +/- line if provided)
         q = db.query(Report).filter(Report.stop_id == stop_id)
-        if line_id: q = q.filter(Report.line_id == line_id)
+        if line_id:
+            q = q.filter(Report.line_id == line_id)
         recent_cutoff = now - timedelta(seconds=REPORT_DECAY_SECONDS * 2)
         reports = q.filter(Report.timestamp >= recent_cutoff).all()
-        rep_list = [(r.arrival_seconds, (now - r.timestamp).total_seconds()) for r in reports]
+
+        rep_list = []
+        for r in reports:
+            age = (now - r.timestamp).total_seconds()
+            rep_list.append((r.arrival_seconds, age))
+
         crowd_eta = weighted_avg_reports(rep_list)
 
+        # check latest live feed
         live_eta = None
-        cand = next_arrivals_for_stop(stop_id, line_id, limit=1)
-        if cand:
-            c = cand[0]
-            live_eta = max(0, int(round(c["eta"])))
+        live_payload = None
+        latest_live = db.query(LiveUpdate).order_by(LiveUpdate.fetched_at.desc()).first()
+        if latest_live and latest_live.payload:
+            # payload format depends on transit agency; try to find an arrival for stop+line
+            payload = latest_live.payload
+            # store raw payload in details if used
+            live_payload = payload
+            # Attempt a few common shapes in payload
+            # Example: payload might have "arrivals": [{"stop_id":..., "line":..., "eta_seconds":...}, ...]
+            items = []
+            if isinstance(payload, dict):
+                items = payload.get("arrivals") or payload.get("predictions") or payload.get("vehicles") or []
+            if isinstance(items, list):
+                for it in items:
+                    try:
+                        sid = str(it.get("stop_id") or it.get("stop"))
+                        lid = str(it.get("line") or it.get("route") or it.get("route_id") or it.get("trip_short_name"))
+                        eta = it.get("eta_seconds") or it.get("arrival_in_seconds") or it.get("arrival_seconds")
+                        if eta is None:
+                            continue
+                        if str(sid) == str(stop_id) and (not line_id or str(lid) == str(line_id)):
+                            live_eta = int(eta)
+                            break
+                    except Exception:
+                        continue
 
-        combined_eta, source = None, "schedule"
+        # Combine sources: prefer crowd if multiple recent reports, otherwise live, else schedule
+        source = "schedule"
+        combined_eta = None
         details = {"crowd_count": len(rep_list)}
         if crowd_eta is not None:
-            combined_eta, source = crowd_eta, "crowd"
+            combined_eta = crowd_eta
+            source = "crowd"
             details["crowd_eta"] = crowd_eta
         if live_eta is not None:
+            # weigh live slightly higher if crowd is old or absent
             if combined_eta is None:
-                combined_eta, source = live_eta, "live_feed"
+                combined_eta = live_eta
+                source = "live_feed"
             else:
+                # simple fusion: average with preference to lower latency (assume live fresher)
                 combined_eta = int((combined_eta * 0.4) + (live_eta * 0.6))
                 source = "crowd+live"
             details["live_eta"] = live_eta
+            details["live_sample"] = live_payload if live_payload and len(str(live_payload)) < 2000 else None
 
         if combined_eta is None:
-            headway = 10 * 60
-            sec = int(time.time())
-            next_arrival = ((sec // headway) + 1) * headway
-            combined_eta = next_arrival - sec
-            details["assumed_headway"] = headway
+            # fallback schedule: assume regular headway (e.g., every 10 minutes)
+            headway = 10 * 60  # seconds
+            # simple deterministic schedule: next arrival occurs at nearest multiple of headway from epoch
+            seconds_since_epoch = int(time.time())
+            next_arrival = ((seconds_since_epoch // headway) + 1) * headway
+            combined_eta = max(0, next_arrival - seconds_since_epoch)
+            source = "schedule"
+            details["assumed_headway_seconds"] = headway
 
-        return ETAOut(stop_id=stop_id, line_id=line_id, eta_seconds=combined_eta, source=source, details=details)
+        # Add walking/biking time from origin to stop if requested
+        walk_bike_seconds = 0
+        if origin_lat is not None and origin_lng is not None:
+            dist_km = haversine_km(origin_lat, origin_lng, stop.lat, stop.lng)
+            if mode == "walking":
+                speed_kmh = 5.0
+            elif mode == "biking":
+                speed_kmh = 15.0
+            else:
+                # mode transit: assume walking to stop
+                speed_kmh = 5.0
+            walk_time_hours = dist_km / max(0.001, speed_kmh)
+            walk_bike_seconds = int(walk_time_hours * 3600)
+            details["origin_distance_km"] = round(dist_km, 3)
+            details["walk_bike_seconds"] = walk_bike_seconds
 
-@app.get("/vehicles")
-def vehicles(): return VEHICLES
+        # For transit preference add waiting time (combined_eta) after walking to stop
+        if mode in ("walking", "biking"):
+            eta_seconds = walk_bike_seconds  # arrive at destination by walking/biking; user may want door-to-door
+            # If they asked for transit but prefer walking/biking, could compute both; here we assume they want travel time to stop.
+            source = source if source != "schedule" else ("estimate" if walk_bike_seconds else "schedule")
+        else:
+            # transit mode: walking time to stop (if provided) plus transit arrival
+            eta_seconds = combined_eta + walk_bike_seconds
 
-@app.get("/alerts")
-def alerts(): return ALERTS
+        return ETAOut(
+            stop_id=stop_id,
+            line_id=line_id,
+            eta_seconds=int(max(0, eta_seconds)),
+            source=source,
+            details=details,
+        )
 
+
+@app.get('/routes')
+def list_routes():
+    with SessionLocal() as db:
+        try:
+            rows = db.execute(
+                "SELECT id, short_name, long_name, route_type FROM routes"
+            ).fetchall()
+        except Exception:
+            return []
+        return [
+            {"id": r[0], "short_name": r[1], "long_name": r[2], "route_type": r[3]}
+            for r in rows
+        ]
+
+
+@app.get('/routes/{route_id}/stops')
+def route_stops(route_id: str):
+    # Return ordered stops for a route by joining route_stops -> stops
+    with SessionLocal() as db:
+        try:
+            rows = db.execute(
+                "SELECT rs.stop_sequence, s.id, s.name, s.lat, s.lng FROM route_stops rs JOIN stops s ON rs.stop_id = s.id WHERE rs.route_id = ? ORDER BY rs.stop_sequence",
+                (route_id,)
+            ).fetchall()
+        except Exception:
+            return []
+        return [
+            {"sequence": r[0], "id": r[1], "name": r[2], "lat": r[3], "lng": r[4]} for r in rows
+        ]
+
+# Serve the static frontend (if present) at the root path
 try:
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
 except Exception:
+    # If StaticFiles can't be mounted for any reason, ignore so backend still works
     pass
