@@ -104,7 +104,7 @@ function Map({
   useEffect(() => {
     const fetchCrowdLocations = async () => {
       try {
-        const response = await fetch('http://localhost:8000/api/crowds')
+        const response = await fetch('https://dubhacks-grow-1.onrender.com/api/crowds')
         const data = await response.json()
         setCrowdLocations(data)
       } catch (error) {
@@ -118,7 +118,7 @@ function Map({
   useEffect(() => {
     const fetchDangerZones = async () => {
       try {
-        const response = await fetch('http://localhost:8000/api/dangers')
+        const response = await fetch('https://dubhacks-grow-1.onrender.com/api/dangers')
         console.log('Danger zones response status:', response.status)
         
         if (!response.ok) {
@@ -145,7 +145,7 @@ function Map({
   useEffect(() => {
     const fetchTodayEvents = async () => {
       try {
-        const response = await fetch('http://localhost:8000/api/events')
+        const response = await fetch('https://dubhacks-grow-1.onrender.com/api/events')
         console.log('Events response status:', response.status)
         
         if (!response.ok) {

@@ -92,7 +92,7 @@ function App() {
     }
 
     try {
-      const response = await fetch('http://localhost:8000/api/report-crowd', {
+      const response = await fetch('https://dubhacks-grow-1.onrender.com/api/report-crowd', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -122,7 +122,7 @@ function App() {
     }
 
     try {
-      const response = await fetch('http://localhost:8000/api/report-danger', {
+      const response = await fetch('https://dubhacks-grow-1.onrender.com/api/report-danger', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -161,7 +161,7 @@ function App() {
     }
 
     try {
-      const response = await fetch('http://localhost:8000/api/add-event', {
+      const response = await fetch('https://dubhacks-grow-1.onrender.com/api/add-event', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -218,7 +218,7 @@ function App() {
   useEffect(() => {
     const fetchTodayEvents = async () => {
       try {
-        const response = await fetch('http://localhost:8000/api/events')
+        const response = await fetch('https://dubhacks-grow-1.onrender.com/api/events')
         if (!response.ok) return
         
         const data = await response.json()
