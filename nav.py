@@ -2,6 +2,7 @@ import os
 import csv
 import math
 import time
+import json
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
@@ -22,6 +23,7 @@ load_dotenv()
 GTFS_DIR = os.getenv("GTFS_DIR", "./gtfs_static")
 TRIP_UPDATES_URL = os.getenv("TRIP_UPDATES_URL", "")    # optional
 MAX_WALK_METERS_DEFAULT = int(os.getenv("MAX_WALK_METERS", "800"))  # ~10 min walk
+MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 
 # ----------------------------
 # Helpers
@@ -174,6 +176,8 @@ class Leg(BaseModel):
     dep_time: Optional[str] = None
     arr_time: Optional[str] = None
     duration_sec: int
+    geometry: Optional[List[List[float]]] = None   # [[lng,lat], ...] GeoJSON-style for map drawing
+    steps: Optional[List[Dict[str, Any]]] = None   # turn-by-turn steps for WALK legs
 
 class Itinerary(BaseModel):
     duration_sec: int
@@ -357,6 +361,52 @@ def plan_one_transfer(
     return uniq[:5]
 
 # ----------------------------
+# Real walking navigation (Mapbox Directions)
+# ----------------------------
+def fetch_walking_directions_mapbox(
+    from_lat: float,
+    from_lng: float,
+    to_lat: float,
+    to_lng: float,
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns a dict with 'geometry' (list of [lng,lat]) and 'steps' (list of instructions),
+    and 'duration_sec' if available. Uses Mapbox Directions API with geojson geometry.
+    """
+    if not MAPBOX_TOKEN:
+        return None
+    try:
+        url = (
+            "https://api.mapbox.com/directions/v5/mapbox/walking/"
+            f"{from_lng},{from_lat};{to_lng},{to_lat}"
+            "?alternatives=false&overview=full&geometries=geojson&steps=true&language=en"
+            f"&access_token={MAPBOX_TOKEN}"
+        )
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        routes = data.get("routes") or []
+        if not routes:
+            return None
+        best = routes[0]
+        geom = best.get("geometry", {}).get("coordinates", [])
+        duration_sec = int(best.get("duration", 0))
+        steps: List[Dict[str, Any]] = []
+        for leg in (best.get("legs") or []):
+            for step in (leg.get("steps") or []):
+                # keep only essentials to keep payload small
+                steps.append({
+                    "maneuver": step.get("maneuver", {}).get("instruction", ""),
+                    "distance_m": step.get("distance", 0),
+                    "duration_s": int(step.get("duration", 0)),
+                    "name": step.get("name", ""),
+                })
+        return {"geometry": geom, "steps": steps, "duration_sec": duration_sec}
+    except Exception:
+        # Fail soft: if directions fail, we simply return None and keep haversine estimate
+        return None
+
+# ----------------------------
 # FastAPI service
 # ----------------------------
 app = FastAPI(title="Pure Navigation Planner")
@@ -368,6 +418,7 @@ def health():
         "gtfs_loaded_routes": len(ROUTES),
         "gtfs_loaded_trips": len(TRIPS),
         "realtime": bool(TRIP_UPDATES_URL),
+        "mapbox_configured": bool(MAPBOX_TOKEN),
     }
 
 # Nearby stops endpoint
@@ -417,6 +468,7 @@ def plan(
     max_walk_m: int = Query(MAX_WALK_METERS_DEFAULT, ge=100),
     use_realtime: bool = Query(True, description="use GTFS-RT TripUpdates if available"),
     refresh_rt: bool = Query(False, description="force pull latest TripUpdates this request"),
+    enhance_walk: bool = Query(False, description="if true, fetch real walking paths and steps"),
 ):
     if refresh_rt and use_realtime:
         fetch_trip_updates()
@@ -436,5 +488,26 @@ def plan(
 
     if not itineraries:
         raise HTTPException(status_code=404, detail="No itinerary found within walking radius / schedule window.")
+
+    # Optionally enhance walking legs with real directions (Mapbox)
+    if enhance_walk:
+        for it in itineraries:
+            for leg in it.legs:
+                if leg.mode == "WALK":
+                    nav = fetch_walking_directions_mapbox(
+                        from_lat=leg.from_lat, from_lng=leg.from_lng,
+                        to_lat=leg.to_lat, to_lng=leg.to_lng
+                    )
+                    if nav:
+                        # attach geometry and steps
+                        leg.geometry = nav.get("geometry")
+                        leg.steps = nav.get("steps")
+                        # prefer API-provided duration if reasonable (> 0)
+                        api_dur = int(nav.get("duration_sec") or 0)
+                        if api_dur > 0:
+                            leg.duration_sec = api_dur
+        # recompute itinerary totals if any leg durations changed
+        for it in itineraries:
+            it.duration_sec = sum(leg.duration_sec for leg in it.legs)
 
     return itineraries[:5]
