@@ -23,7 +23,12 @@ load_dotenv()
 GTFS_DIR = os.getenv("GTFS_DIR", "./gtfs_static")
 TRIP_UPDATES_URL = os.getenv("TRIP_UPDATES_URL", "")    # optional
 MAX_WALK_METERS_DEFAULT = int(os.getenv("MAX_WALK_METERS", "800"))  # ~10 min walk
+
 MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
+# Optional: per-road danger map (name/type → 1..10 danger score)
+DANGER_MAP_PATH = os.getenv("DANGER_MAP_PATH", "./danger_map.json")
+# Optional: circle-based safety zones (higher score = safer). Default to your circles file.
+SAFETY_ZONES_PATH = os.getenv("SAFETY_ZONES_PATH", "./danger_zone.json")
 
 # ----------------------------
 # Helpers
@@ -178,6 +183,70 @@ class Leg(BaseModel):
     duration_sec: int
     geometry: Optional[List[List[float]]] = None   # [[lng,lat], ...] GeoJSON-style for map drawing
     steps: Optional[List[Dict[str, Any]]] = None   # turn-by-turn steps for WALK legs
+    safety_zones_score: Optional[float] = None     # 0..1 from circle zones file (if provided)
+    safety_score: Optional[float] = None           # 0..1 combined (danger-map + zones)
+    safety_matches: Optional[List[Dict[str, Any]]] = None  # evidence used to compute score
+    # Optional: up to N alternative walking options (Mapbox), each with its own safety and duration
+    alt_options: Optional[List[Dict[str, Any]]] = None
+    walk_summary: Optional[str] = None   # brief Mapbox summary for the chosen walking path
+# ----------------------------
+# Real walking navigation (Mapbox Directions)
+# ----------------------------
+
+def fetch_walking_routes_mapbox(
+    from_lat: float,
+    from_lng: float,
+    to_lat: float,
+    to_lng: float,
+    max_alts: int = 0,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Returns a list of up to (max_alts + 1) route dicts:
+    { 'geometry': [[lng,lat], ...], 'steps': [...], 'duration_sec': int }
+    First route is Mapbox's primary. Requires MAPBOX_TOKEN.
+    """
+    if not MAPBOX_TOKEN:
+        return None
+    try:
+        # Use alternatives=true to request multiple candidate routes.
+        url = (
+            "https://api.mapbox.com/directions/v5/mapbox/walking/"
+            f"{from_lng},{from_lat};{to_lng},{to_lat}"
+            "?alternatives=true&overview=full&geometries=geojson&steps=true&language=en"
+            f"&access_token={MAPBOX_TOKEN}"
+        )
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        routes = data.get("routes") or []
+        if not routes:
+            return None
+        out: List[Dict[str, Any]] = []
+        for i, best in enumerate(routes):
+            if i > max_alts:  # cap count: primary + max_alts
+                break
+            geom = best.get("geometry", {}).get("coordinates", [])
+            duration_sec = int(best.get("duration", 0) or 0)
+            summary = ""
+            try:
+                # Mapbox puts a human-readable summary on the first leg
+                if best.get("legs"):
+                    summary = best["legs"][0].get("summary") or ""
+            except Exception:
+                summary = ""
+            steps: List[Dict[str, Any]] = []
+            for leg in (best.get("legs") or []):
+                for step in (leg.get("steps") or []):
+                    steps.append({
+                        "maneuver": step.get("maneuver", {}).get("instruction", ""),
+                        "distance_m": step.get("distance", 0),
+                        "duration_s": int(step.get("duration", 0) or 0),
+                        "name": step.get("name", ""),
+                    })
+            out.append({"geometry": geom, "steps": steps, "duration_sec": duration_sec, "summary": summary})
+        return out or None
+    except Exception:
+        return None
 
 class Itinerary(BaseModel):
     duration_sec: int
@@ -363,6 +432,7 @@ def plan_one_transfer(
 # ----------------------------
 # Real walking navigation (Mapbox Directions)
 # ----------------------------
+
 def fetch_walking_directions_mapbox(
     from_lat: float,
     from_lng: float,
@@ -407,6 +477,182 @@ def fetch_walking_directions_mapbox(
         return None
 
 # ----------------------------
+# Danger map loader + scoring
+#   Accepts JSON like:
+#   {
+#     "roads": {"Stevens Way NE": 2, "Memorial Way NE": 3},
+#     "types": {"alley": 9, "arterial": 6, "trail": 2},
+#     "default": 5
+#   }
+#   Danger scale: 1 (safest) .. 10 (most dangerous)
+#   Safety score we compute: 1.0 .. 0.0  (1 - normalized danger)
+# ----------------------------
+DANGER_MAP: Dict[str, Any] = {"roads": {}, "types": {}, "default": 5}
+
+def _load_danger_map():
+    global DANGER_MAP
+    p = Path(DANGER_MAP_PATH)
+    if not p.exists():
+        return
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        # normalize keys
+        roads = { (k or "").strip().lower(): int(v) for k, v in (data.get("roads") or {}).items() }
+        types = { (k or "").strip().lower(): int(v) for k, v in (data.get("types") or {}).items() }
+        default = int(data.get("default", 5))
+        DANGER_MAP = {"roads": roads, "types": types, "default": default}
+    except Exception:
+        # keep defaults on parse error
+        DANGER_MAP = {"roads": {}, "types": {}, "default": 5}
+
+def _danger_to_safety(danger: int) -> float:
+    # Map 1..10 danger → 1..0 safety (linear)
+    danger = max(1, min(10, int(danger)))
+    return round(1.0 - (danger - 1) / 9.0, 3)
+
+def _infer_type_from_name(name: str) -> Optional[str]:
+    n = (name or "").lower()
+    if "alley" in n: return "alley"
+    if "trail" in n or "path" in n or "walk" in n: return "trail"
+    if "way" in n: return "arterial"
+    if "ave" in n or "avenue" in n or "st " in n or "street" in n or "blvd" in n: return "street"
+    return None
+
+def annotate_leg_from_danger_map(leg: 'Leg'):
+    """
+    Uses Mapbox steps (if present) to compute a safety score from your danger map.
+    - For each step, look up an exact road-name match in DANGER_MAP["roads"].
+    - Else try an inferred 'type' in DANGER_MAP["types"].
+    - Else use DANGER_MAP["default"].
+    The per-step safety is distance-weighted.
+    """
+    steps = leg.steps or []
+    if not steps:
+        # No steps (e.g., enhance_walk=false) → neutral score from default
+        s = _danger_to_safety(DANGER_MAP.get("default", 5))
+        leg.safety_score = s
+        leg.safety_matches = [{"name": None, "danger": DANGER_MAP.get("default", 5), "safety": s, "distance_m": None}]
+        return
+
+    total_dist = 0.0
+    weighted = 0.0
+    matches: List[Dict[str, Any]] = []
+    for st in steps:
+        name = (st.get("name") or "").strip()
+        dist = float(st.get("distance_m") or 0.0)
+        key = name.lower()
+        danger = DANGER_MAP["roads"].get(key)
+        if danger is None:
+            typ = _infer_type_from_name(name)
+            if typ:
+                danger = DANGER_MAP["types"].get(typ)
+        if danger is None:
+            danger = DANGER_MAP.get("default", 5)
+        safety = _danger_to_safety(danger)
+        matches.append({"name": name, "danger": int(danger), "safety": safety, "distance_m": dist})
+        total_dist += dist
+        weighted += safety * dist
+
+    if total_dist <= 0:
+        # fallback if distances missing
+        if matches:
+            avg = sum(m["safety"] for m in matches) / len(matches)
+        else:
+            avg = _danger_to_safety(DANGER_MAP.get("default", 5))
+        leg.safety_score = round(avg, 3)
+    else:
+        leg.safety_score = round(weighted / total_dist, 3)
+    leg.safety_matches = matches
+
+# ----------------------------
+# Safety Zones (circle areas with score 0..1)
+#   File format:
+#   { "zones": [ { "type":"circle","lat":..., "lng":..., "radius_m": 150, "score": 0.8, "label":"..." }, ... ] }
+# ----------------------------
+SAFETY_ZONES: Dict[str, Any] = {"zones": []}
+
+def _load_safety_zones():
+    global SAFETY_ZONES
+    p = Path(SAFETY_ZONES_PATH)
+    if not p.exists():
+        SAFETY_ZONES = {"zones": []}
+        return
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        zones = data.get("zones") or []
+        # basic validation/normalization
+        norm = []
+        for z in zones:
+            if (z.get("type") or "circle").lower() != "circle":
+                continue
+            try:
+                norm.append({
+                    "lat": float(z["lat"]),
+                    "lng": float(z["lng"]),
+                    "radius_m": float(z.get("radius_m", 120)),
+                    "score": max(0.0, min(1.0, float(z.get("score", 0.5)))),
+                    "label": str(z.get("label") or "")
+                })
+            except Exception:
+                continue
+        SAFETY_ZONES = {"zones": norm}
+    except Exception:
+        SAFETY_ZONES = {"zones": []}
+
+def _point_in_circle(lat: float, lng: float, center_lat: float, center_lng: float, radius_m: float) -> bool:
+    return haversine_m(lat, lng, center_lat, center_lng) <= radius_m
+
+def _zone_score_at(lat: float, lng: float) -> Optional[float]:
+    """Return the highest zone score covering this point, or None if no zone."""
+    best = None
+    for z in SAFETY_ZONES.get("zones", []):
+        if _point_in_circle(lat, lng, z["lat"], z["lng"], z["radius_m"]):
+            s = float(z["score"])
+            best = s if best is None else max(best, s)
+    return best
+
+def annotate_leg_from_zones(leg: 'Leg'):
+    """
+    Sample the walking geometry (or endpoints) against circle zones to compute a safety_zones_score.
+    """
+    samples: List[Tuple[float, float]] = []
+    if leg.geometry:
+        # geometry is [[lng,lat], ...]; downsample to keep it light
+        for i, pt in enumerate(leg.geometry):
+            if i % 4 == 0:
+                samples.append((float(pt[1]), float(pt[0])))
+    else:
+        # fallback: endpoints + midpoint
+        samples = [
+            (leg.from_lat, leg.from_lng),
+            ((leg.from_lat + leg.to_lat) / 2.0, (leg.from_lng + leg.to_lng) / 2.0),
+            (leg.to_lat, leg.to_lng),
+        ]
+    values: List[float] = []
+    evid: List[Dict[str, Any]] = []
+    for (la, lo) in samples:
+        s = _zone_score_at(la, lo)
+        if s is not None:
+            values.append(s)
+            evid.append({"source": "zone", "lat": la, "lng": lo, "score": round(s, 3)})
+    if values:
+        leg.safety_zones_score = round(sum(values) / len(values), 3)
+        # append to safety_matches evidence
+        leg.safety_matches = (leg.safety_matches or []) + evid
+
+# load danger map once
+try:
+    _load_danger_map()
+except Exception:
+    pass
+
+# load safety zones once
+try:
+    _load_safety_zones()
+except Exception:
+    pass
+
+# ----------------------------
 # FastAPI service
 # ----------------------------
 app = FastAPI(title="Pure Navigation Planner")
@@ -419,7 +665,31 @@ def health():
         "gtfs_loaded_trips": len(TRIPS),
         "realtime": bool(TRIP_UPDATES_URL),
         "mapbox_configured": bool(MAPBOX_TOKEN),
+        "danger_map_loaded": Path(DANGER_MAP_PATH).exists(),
+        "danger_roads_count": len(DANGER_MAP.get("roads", {})),
+        "danger_types_count": len(DANGER_MAP.get("types", {})),
+        "safety_zones_loaded": Path(SAFETY_ZONES_PATH).exists(),
+        "safety_zones_count": len(SAFETY_ZONES.get("zones", [])),
     }
+
+# --- Safety config endpoints ---
+@app.get("/safety/config")
+def safety_config():
+    return {
+        "zones_count": len(SAFETY_ZONES.get("zones", [])),
+        "zones_path": str(Path(SAFETY_ZONES_PATH).resolve()),
+        "danger_map_path": str(Path(DANGER_MAP_PATH).resolve())
+    }
+
+@app.post("/safety/reload")
+def safety_reload():
+    _load_safety_zones()
+    return {"ok": True, "zones_count": len(SAFETY_ZONES.get("zones", []))}
+
+@app.post("/danger/reload")
+def danger_reload():
+    _load_danger_map()
+    return {"ok": True, "roads": len(DANGER_MAP.get("roads", {})), "types": len(DANGER_MAP.get("types", {}))}
 
 # Nearby stops endpoint
 @app.get("/nearby_stops")
@@ -469,11 +739,22 @@ def plan(
     use_realtime: bool = Query(True, description="use GTFS-RT TripUpdates if available"),
     refresh_rt: bool = Query(False, description="force pull latest TripUpdates this request"),
     enhance_walk: bool = Query(False, description="if true, fetch real walking paths and steps"),
+    walk_alternatives: int = Query(0, ge=0, le=5, description="If >0 and enhance_walk, attach up to N alternative walking routes per WALK leg"),
+    safety: str = Query("off", regex="^(off|prefer|strict)$", description="Apply per-road safety bias using danger_map.json"),
+    reject_walk_below: Optional[float] = Query(
+        None, ge=0.0, le=1.0,
+        description="If set (or if safety=strict with default), reject itineraries whose min WALK safety_score is below this value."
+    ),
+    allow_walk_only: bool = Query(True, description="If true, return a walk-only itinerary when no transit plan is found"),
+    walk_only_max_m: int = Query(5000, ge=100, description="Max straight-line distance (meters) allowed for walk-only fallback"),
 ):
     if refresh_rt and use_realtime:
         fetch_trip_updates()
 
     depart_after = now_local_sec() if depart_now or not depart_time_s else int(depart_time_s)
+    # If strict safety is requested and caller didn't set a threshold, use a sensible default
+    if safety == "strict" and reject_walk_below is None:
+        reject_walk_below = 0.40  # reject walks scored below 0.40 (≈ danger > ~7/10)
 
     itineraries: List[Itinerary] = []
     # First try direct
@@ -487,27 +768,214 @@ def plan(
         )
 
     if not itineraries:
+        # Optional walk-only fallback when no transit plan is found
+        if allow_walk_only:
+            # Use straight-line distance as a quick guard before asking Mapbox
+            dist_m = haversine_m(from_lat, from_lng, to_lat, to_lng)
+            if dist_m <= float(walk_only_max_m):
+                # Try to fetch a real walking path (with optional alternatives) and score it
+                routes = fetch_walking_routes_mapbox(
+                    from_lat=from_lat, from_lng=from_lng,
+                    to_lat=to_lat, to_lng=to_lng,
+                    max_alts=walk_alternatives if enhance_walk and walk_alternatives > 0 else 0,
+                )
+                candidates: List[Dict[str, Any]] = []
+                if routes:
+                    for rt in routes:
+                        tmp = Leg(
+                            mode="WALK",
+                            from_name="Origin", to_name="Destination",
+                            from_lat=from_lat, from_lng=from_lng,
+                            to_lat=to_lat, to_lng=to_lng,
+                            duration_sec=int(rt.get("duration_sec") or max(1, int(dist_m / (5.0 * 1000/3600)))),
+                            geometry=rt.get("geometry"),
+                            steps=rt.get("steps"),
+                            walk_summary=rt.get("summary") or None,
+                        )
+                        annotate_leg_from_danger_map(tmp)
+                        annotate_leg_from_zones(tmp)
+                        parts = [x for x in [tmp.safety_score, tmp.safety_zones_score] if x is not None]
+                        if parts:
+                            tmp.safety_score = round(sum(parts) / len(parts), 3)
+                        biased = tmp.duration_sec
+                        if safety in ("prefer", "strict") and tmp.safety_score is not None:
+                            factor = 1.0 + (1.0 - tmp.safety_score) * (0.3 if safety == "prefer" else 0.6)
+                            biased = int(biased * factor)
+                        candidates.append({
+                            "leg": tmp,
+                            "biased": biased,
+                        })
+                else:
+                    # No Mapbox or fetch failed — build a simple straight-line walk leg
+                    tmp = build_walk_leg("Origin", from_lat, from_lng, "Destination", to_lat, to_lng)
+                    annotate_leg_from_danger_map(tmp)
+                    annotate_leg_from_zones(tmp)
+                    parts = [x for x in [tmp.safety_score, tmp.safety_zones_score] if x is not None]
+                    if parts:
+                        tmp.safety_score = round(sum(parts) / len(parts), 3)
+                    biased = tmp.duration_sec
+                    if safety in ("prefer", "strict") and tmp.safety_score is not None:
+                        factor = 1.0 + (1.0 - tmp.safety_score) * (0.3 if safety == "prefer" else 0.6)
+                        biased = int(biased * factor)
+                    candidates = [{"leg": tmp, "biased": biased}]
+
+                # Choose the best walk option
+                best = min(candidates, key=lambda c: c["biased"]) if candidates else None
+                if best:
+                    walk_leg = best["leg"]
+                    # Respect strict safety rejection if configured
+                    if reject_walk_below is not None and walk_leg.safety_score is not None and walk_leg.safety_score < float(reject_walk_below):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Walk-only option rejected by safety filter (threshold={reject_walk_below}). Try lowering the threshold or using safety=prefer."
+                        )
+                    depart_after = now_local_sec() if depart_now or not depart_time_s else int(depart_time_s)
+                    depart_time = s2t(depart_after)
+                    arrive_time = s2t(depart_after + walk_leg.duration_sec)
+                    it = Itinerary(
+                        duration_sec=walk_leg.duration_sec,
+                        depart_time=depart_time,
+                        arrive_time=arrive_time,
+                        transfers=0,
+                        legs=[walk_leg],
+                        notes="Walk-only fallback"
+                    )
+                    return [it]
+        # No transit and no acceptable walk-only fallback
         raise HTTPException(status_code=404, detail="No itinerary found within walking radius / schedule window.")
 
     # Optionally enhance walking legs with real directions (Mapbox)
     if enhance_walk:
         for it in itineraries:
             for leg in it.legs:
-                if leg.mode == "WALK":
-                    nav = fetch_walking_directions_mapbox(
+                if leg.mode != "WALK":
+                    continue
+                # If alternatives requested, fetch multiple; else just the primary.
+                routes = fetch_walking_routes_mapbox(
+                    from_lat=leg.from_lat, from_lng=leg.from_lng,
+                    to_lat=leg.to_lat, to_lng=leg.to_lng,
+                    max_alts=walk_alternatives if walk_alternatives > 0 else 0
+                )
+                if not routes:
+                    continue
+
+                # Build candidate options with safety annotations and biased durations
+                candidates: List[Dict[str, Any]] = []
+                for rt in routes:
+                    # Create a temporary leg to score this option
+                    tmp = Leg(
+                        mode="WALK",
+                        from_name=leg.from_name, to_name=leg.to_name,
                         from_lat=leg.from_lat, from_lng=leg.from_lng,
-                        to_lat=leg.to_lat, to_lng=leg.to_lng
+                        to_lat=leg.to_lat, to_lng=leg.to_lng,
+                        duration_sec=int(rt.get("duration_sec") or leg.duration_sec),
+                        geometry=rt.get("geometry"),
+                        steps=rt.get("steps"),
+                        walk_summary=rt.get("summary") or None
                     )
-                    if nav:
-                        # attach geometry and steps
-                        leg.geometry = nav.get("geometry")
-                        leg.steps = nav.get("steps")
-                        # prefer API-provided duration if reasonable (> 0)
-                        api_dur = int(nav.get("duration_sec") or 0)
-                        if api_dur > 0:
-                            leg.duration_sec = api_dur
-        # recompute itinerary totals if any leg durations changed
+                    # Safety annotations (danger map + zones)
+                    annotate_leg_from_danger_map(tmp)
+                    annotate_leg_from_zones(tmp)
+                    # Combine sources if both exist
+                    parts = [x for x in [tmp.safety_score, tmp.safety_zones_score] if x is not None]
+                    if parts:
+                        tmp.safety_score = round(sum(parts) / len(parts), 3)
+                    # Compute biased duration according to safety mode (mirror later pipeline)
+                    biased = tmp.duration_sec
+                    if safety in ("prefer", "strict") and tmp.safety_score is not None:
+                        if safety == "prefer":
+                            factor = 1.0 + (1.0 - tmp.safety_score) * 0.3
+                        else:
+                            factor = 1.0 + (1.0 - tmp.safety_score) * 0.6
+                        biased = int(biased * factor)
+                    candidates.append({
+                        "geometry": tmp.geometry,
+                        "steps": tmp.steps,
+                        "duration_sec": tmp.duration_sec,
+                        "safety_score": tmp.safety_score,
+                        "safety_zones_score": tmp.safety_zones_score,
+                        "safety_matches": tmp.safety_matches,
+                        "biased_duration_sec": biased,
+                        "summary": tmp.walk_summary,
+                    })
+
+                # Choose the candidate with the smallest biased duration
+                best = min(candidates, key=lambda c: c["biased_duration_sec"])
+                # Set the chosen route onto the leg
+                leg.geometry = best["geometry"]
+                leg.steps = best["steps"]
+                leg.duration_sec = best["duration_sec"]
+                leg.safety_score = best["safety_score"]
+                leg.safety_zones_score = best["safety_zones_score"]
+                leg.safety_matches = best["safety_matches"]
+                leg.walk_summary = best.get("summary")
+
+                # Store remaining candidates as alternatives (excluding the chosen one)
+                others = [c for c in candidates if c is not best]
+                # Trim to at most walk_alternatives entries
+                if walk_alternatives > 0 and others:
+                    leg.alt_options = [
+                        {
+                            "geometry": c["geometry"],
+                            "steps": c["steps"],
+                            "duration_sec": c["duration_sec"],
+                            "safety_score": c["safety_score"],
+                            "safety_zones_score": c["safety_zones_score"],
+                            "biased_duration_sec": c["biased_duration_sec"],
+                            "summary": c.get("summary"),
+                        }
+                        for c in others[:walk_alternatives]
+                    ]
+                else:
+                    leg.alt_options = None
+
+    # --- Annotate safety for all WALK legs (zones + danger map), then optionally bias durations ---
+    for it in itineraries:
+        for leg in it.legs:
+            if leg.mode != "WALK":
+                continue
+            # If enhance_walk + alternatives already scored this leg, skip re-annotation.
+            if enhance_walk and leg.safety_matches:
+                pass
+            else:
+                annotate_leg_from_danger_map(leg)
+                annotate_leg_from_zones(leg)
+                parts = [x for x in [leg.safety_score, leg.safety_zones_score] if x is not None]
+                if parts:
+                    leg.safety_score = round(sum(parts) / len(parts), 3)
+            # Apply bias if requested (this still runs so totals include bias)
+            if safety in ("prefer", "strict") and leg.safety_score is not None:
+                if safety == "prefer":
+                    factor = 1.0 + (1.0 - leg.safety_score) * 0.3
+                else:
+                    factor = 1.0 + (1.0 - leg.safety_score) * 0.6
+                leg.duration_sec = int(leg.duration_sec * factor)
+
+    # --- Option 3: Reject itineraries that cross unsafe zones (hard filter) ---
+    if reject_walk_below is not None:
+        survivors: List[Itinerary] = []
         for it in itineraries:
-            it.duration_sec = sum(leg.duration_sec for leg in it.legs)
+            walk_scores = [leg.safety_score for leg in it.legs if leg.mode == "WALK" and leg.safety_score is not None]
+            # If no walk legs have scores, keep it (can't judge), otherwise require all walk legs to meet threshold
+            if walk_scores and min(walk_scores) < float(reject_walk_below):
+                continue
+            survivors.append(it)
+        itineraries = survivors
+        if not itineraries:
+            raise HTTPException(
+                status_code=404,
+                detail=f"All candidate itineraries were rejected by the safety filter (threshold={reject_walk_below}). Try lowering the threshold or using safety=prefer."
+            )
+
+    # recompute itinerary totals if any leg durations changed
+    for it in itineraries:
+        it.duration_sec = sum(leg.duration_sec for leg in it.legs)
+
+    # If safety biasing is enabled, sort by (duration, -avg walk safety) so safer paths win ties
+    if safety in ("prefer", "strict"):
+        def avg_walk_safety(it: Itinerary) -> float:
+            vals = [leg.safety_score for leg in it.legs if leg.mode == "WALK" and leg.safety_score is not None]
+            return sum(vals)/len(vals) if vals else 0.5
+        itineraries.sort(key=lambda it: (it.duration_sec, -avg_walk_safety(it)))
 
     return itineraries[:5]

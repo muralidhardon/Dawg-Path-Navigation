@@ -1,0 +1,44 @@
+{
+  "zones": [
+    {
+      "label": "Red Square (crowded & lit)",
+      "type": "circle",
+      "lat": 47.6566,
+      "lng": -122.3095,
+      "radius_m": 180,
+      "score": 0.9
+    },
+    {
+      "label": "The Ave late-night (use caution)",
+      "type": "circle",
+      "lat": 47.6608,
+      "lng": -122.3139,
+      "radius_m": 220,
+      "score": 0.35
+    },
+    {
+      "label": "Burke-Gilman trail segment (evening)",
+      "type": "circle",
+      "lat": 47.6596,
+      "lng": -122.2987,
+      "radius_m": 250,
+      "score": 0.6
+    },
+    {
+      "label": "UW Link station plaza",
+      "type": "circle",
+      "lat": 47.6499,
+      "lng": -122.3037,
+      "radius_m": 140,
+      "score": 0.85
+    },
+    {
+      "label": "Theta Chi Fraternity (High Danger)",
+      "type": "circle",
+      "lat": 47.6593,
+      "lng": -122.3129,
+      "radius_m": 120,
+      "score": 0.05
+    }
+  ]
+}
