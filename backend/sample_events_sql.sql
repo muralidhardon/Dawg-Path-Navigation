@@ -1,0 +1,20 @@
+-- Sample Events for University of Washington
+INSERT INTO events (name, event_type, latitude, longitude, time, notes, created_at, user_lat, user_lng) VALUES
+('UW Career Fair 2025', 'exhibition', 47.6567, -122.3066, datetime('now', 'start of day', '+14 hours'), 'Annual career fair featuring tech companies and startups. Location: UW Pavilion', datetime('now'), 47.6567, -122.3066),
+('Campus Coffee Social', 'other', 47.6580, -122.3040, datetime('now', 'start of day', '+15 hours'), 'Free coffee and networking for students. Red Square area', datetime('now'), 47.6567, -122.3066),
+('Husky Football Watch Party', 'sports', 47.6550, -122.3090, datetime('now', 'start of day', '+18 hours'), 'Watch the game with fellow students at the Hub. Snacks provided', datetime('now'), 47.6567, -122.3066),
+('Open Mic Night at UW', 'concert', 47.6595, -122.3050, datetime('now', 'start of day', '+20 hours'), 'Student performers showcase their talents. IMA Theater', datetime('now'), 47.6567, -122.3066),
+('Farmers Market - UW District', 'market', 47.6610, -122.3100, datetime('now', 'start of day', '+10 hours'), 'Local vendors selling produce, crafts, and food. University Way NE', datetime('now'), 47.6567, -122.3066),
+('Astronomy Club Meeting', 'other', 47.6540, -122.3000, datetime('now', 'start of day', '+16 hours'), 'Stargazing session weather permitting. Rooftop of Physics Building', datetime('now'), 47.6567, -122.3066),
+('Campus Art Exhibition', 'exhibition', 47.6575, -122.3080, datetime('now', 'start of day', '+12 hours'), 'Student artwork on display. Henry Art Gallery', datetime('now'), 47.6567, -122.3066),
+('Beach Volleyball Tournament', 'sports', 47.6520, -122.3120, datetime('now', 'start of day', '+17 hours'), 'Intramural volleyball championship. Registration at courts', datetime('now'), 47.6567, -122.3066),
+('ACM Tech Talk', 'exhibition', 47.6555, -122.3025, datetime('now', 'start of day', '+11 hours'), 'Cloud computing insights from industry experts. CSE Building Room 305', datetime('now'), 47.6567, -122.3066),
+('Student Band Concert', 'concert', 47.6605, -122.3070, datetime('now', 'start of day', '+19 hours'), 'Various student bands performing. Meany Hall', datetime('now'), 47.6567, -122.3066),
+('Ultimate Frisbee Meetup', 'sports', 47.6530, -122.2980, datetime('now', 'start of day', '+13 hours'), 'Casual pickup game for all skill levels. IMA fields', datetime('now'), 47.6567, -122.3066),
+('Campus Sustainability Fair', 'festival', 47.6590, -122.3110, datetime('now', 'start of day', '+09 hours'), 'Learn about green initiatives on campus. Quad area', datetime('now'), 47.6567, -122.3066),
+('Board Game Meetup', 'other', 47.6515, -122.3055, datetime('now', 'start of day', '+21 hours'), 'Bring your favorite game and meet other players. HUB Craft Center', datetime('now'), 47.6567, -122.3066),
+('Photography Walk', 'other', 47.6625, -122.3090, datetime('now', 'start of day', '+15 hours'), 'Explore campus and capture its beauty. Meet at Kane Hall', datetime('now'), 47.6567, -122.3066),
+('Jazz Night at the U-District', 'concert', 47.6650, -122.3050, datetime('now', 'start of day', '+22 hours'), 'Live jazz performance by student ensemble. Ethnic Cultural Center', datetime('now'), 47.6567, -122.3066),
+('Wellness Workshop', 'other', 47.6545, -122.3100, datetime('now', 'start of day', '+12 hours'), 'Yoga and meditation session. North Campus fitness center', datetime('now'), 47.6567, -122.3066),
+('Computer Science Hackathon', 'festival', 47.6570, -122.3035, datetime('now', 'start of day', '+16 hours'), '24-hour coding competition. Paul Allen Computer Center', datetime('now'), 47.6567, -122.3066),
+('Food Truck Rally', 'market', 47.6580, -122.2995, datetime('now', 'start of day', '+17 hours'), 'Various food trucks serving cuisine from around the world. Central Plaza', datetime('now'), 47.6567, -122.3066);
